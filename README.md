@@ -132,6 +132,14 @@ Once completed, cloud-torrent will no longer be a simple torrent client and most
 
 If you'd like to buy me a coffee or more, you can donate via [PayPal](https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=dev%40jpillora%2ecom&lc=AU&item_name=Open%20Source%20Donation&button_subtype=services&currency_code=USD&bn=PP%2dBuyNowBF%3abtn_buynowCC_LG%2egif%3aNonHosted) or BitCoin `1AxEWoz121JSC3rV8e9MkaN9GAc5Jxvs4`.
 
+### Search Providers Fix
+
+The original remote search configuration (hosted on Gist) was invalid or inaccessible. This fork fixes this by:
+1. Including a local `scraper-config.json` in the repository root.
+2. Modifying the server to load search providers from this local file instead of fetching from a remote URL.
+
+To customize search providers, simply edit `scraper-config.json`.
+
 ### Notes
 
 This project is the rewrite of the original [Node version](https://github.com/jpillora/node-torrent-cloud).

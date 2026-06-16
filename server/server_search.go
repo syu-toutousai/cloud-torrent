@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"time"
 
 	"github.com/jpillora/backoff"
@@ -31,12 +30,7 @@ var fetches = 0
 var currentConfig, _ = normalize(defaultSearchConfig)
 
 func (s *Server) fetchSearchConfig() error {
-	resp, err := http.Get(searchConfigURL)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	newConfig, err := ioutil.ReadAll(resp.Body)
+	newConfig, err := ioutil.ReadFile("scraper-config.json")
 	if err != nil {
 		return err
 	}
