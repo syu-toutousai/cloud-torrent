@@ -147,6 +147,18 @@ def flipped_pieces():
             seenm.append(p)
     return seenm
 
+def last_state_map():
+    """piece -> 'mark' | 'revert' according to the newest ledger event."""
+    st = {}
+    for e in ledger_lines():
+        t = e.get("type")
+        if t == "mark":
+            st[e["piece"]] = "mark"
+        elif t in ("revert", "revert-batch"):
+            for p in e.get("pieces", []):
+                st[p] = "revert"
+    return st
+
 def do_flip(indices, new_val, action_name, note=""):
     was_running = svc_active()
     if was_running:
@@ -187,7 +199,12 @@ def do_flip(indices, new_val, action_name, note=""):
         if not ok:
             sys.exit(3)   # DB changed but service down — needs manual start
 
-def cmd_mark(indices):
+def cmd_mark(indices, force=False):
+    st = last_state_map()
+    guarded = [i for i in indices if st.get(i) == "revert" and not force]
+    if guarded:
+        die(f"pieces {sorted(guarded)} are in endgame-revert state (refill in "
+            f"progress); auto-flip refused. Use --force to override.")
     do_flip(indices, 0x63, "mark",
             note="false-poisoned piece accepted (speed-first triage)")
 
@@ -231,13 +248,16 @@ def main():
     elif argv[0] == "--revert":
         cmd_revert(argv[1:])
     else:
+        force = "--force" in argv
         idx = []
         for a in argv:
+            if a == "--force":
+                continue
             try:
                 idx.append(int(a))
             except ValueError:
                 die(f"bad index: {a}")
-        cmd_mark(idx)
+        cmd_mark(idx, force=force)
 
 if __name__ == "__main__":
     main()
