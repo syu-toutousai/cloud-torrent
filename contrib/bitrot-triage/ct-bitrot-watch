@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Periodic smart-ban sentinel for cloud-torrent bitrot triage.
+
+Each run:
+  1. reads new cloud-torrent journal entries (cursor-tracked, no replays);
+  2. extracts pieces flagged 'sole dirtier ... failed piece check';
+  3. SHA-1-verifies each against metainfo (skip false positives / healed ones);
+  4. hands confirmed-rotten pieces to ct-markpiece (stop -> flip -> start),
+     which journals every flip to marked-pieces.jsonl.
+
+Designed to run from a systemd timer every ~90s.
+"""
+import json, os, re, hashlib, subprocess, sys, time
+
+UNIT = "cloud-torrent.service"
+TORRENT = "/mnt/torrent/f2ddf5a6c8928b1b3ae87023beedff7dc6198517.torrent"
+BASEDIR = "/mnt/torrent/2019-10 【連続テレビ小説】スカーレット - [1920x1080p.EP001-150.END.hevc-vs.mkv][字]"
+STATE = os.path.expanduser("~/.local/state/ct-bitrot-watch")
+CURSOR = os.path.join(STATE, "journal.cursor")
+MARKER = os.path.join(BASEDIR, "")[:-1]
+MARK_TOOL = os.path.expanduser("~/.local/bin/ct-markpiece")
+PAT = re.compile(r"sole dirtier of piece (\d+)")
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def bdecode(b, i=0):
+    c = b[i:i+1]
+    if c == b'd':
+        i += 1; d = {}
+        while b[i:i+1] != b'e':
+            k, i = bdecode(b, i); v, i = bdecode(b, i); d[k] = v
+        return d, i+1
+    if c == b'l':
+        i += 1; l = []
+        while b[i:i+1] != b'e':
+            v, i = bdecode(b, i); l.append(v)
+        return l, i+1
+    if c == b'i':
+        j = b.index(b'e', i); return int(b[i+1:j]), j+1
+    j = b.index(b':', i); n = int(b[i:j]); return b[j+1:j+1+n], j+1+n
+
+def load_meta():
+    t, _ = bdecode(open(TORRENT, 'rb').read())
+    info = t[b'info']
+    dec = lambda x: x.decode('utf-8', 'replace') if isinstance(x, bytes) else x
+    files = [('/'.join(dec(x) for x in f[b'path']), f[b'length']) for f in info[b'files']]
+    return info[b'piece length'], info[b'pieces'], files
+
+def piece_rotten(idx, ps, pieces, files):
+    total = sum(l for _, l in files)
+    if not (0 <= idx * ps < total):
+        return None
+    s, e = idx*ps, min((idx+1)*ps, total)-1
+    h = hashlib.sha1(); off = 0
+    try:
+        for p, l in files:
+            fs, fe = off, off+l-1
+            if not (fe < s or fs > e):
+                path = os.path.join(BASEDIR, p)
+                with open(path, 'rb') as f:
+                    f.seek(max(fs, s)-fs)
+                    h.update(f.read(min(fe, e)-max(fs, s)+1))
+            off += l
+    except FileNotFoundError as ex:
+        log(f"WARN: cannot read for verify: {ex}")
+        return None
+    exp = pieces[idx*20:(idx+1)*20].hex()
+    return h.hexdigest() != exp   # True=rotten, False=intact, None=unknown
+
+def new_journal_messages():
+    """Yield (cursor, message) for entries after stored cursor."""
+    os.makedirs(STATE, exist_ok=True)
+    cmd = ["journalctl", "-u", UNIT, "-o", "json", "--no-pager"]
+    if os.path.exists(CURSOR):
+        cmd += ["--after-cursor", open(CURSOR).read().strip()]
+    else:
+        # first run: pin cursor to latest entry so no future event is missed
+        latest = subprocess.run(["journalctl", "-u", UNIT, "-n1", "-o", "json",
+                                 "--no-pager"], capture_output=True, text=True).stdout
+        cur = None
+        if latest.strip():
+            try:
+                cur = json.loads(latest.strip().splitlines()[-1]).get("__CURSOR")
+            except json.JSONDecodeError:
+                pass
+        if cur:
+            with open(CURSOR, 'w') as f:
+                f.write(cur)
+            log("first run: cursor pinned to journal head")
+            return []
+        cmd += ["--since", f"@{int(time.time())}"]  # empty journal fallback
+        log("first run: journal empty, watching forward")
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout
+    pairs = []
+    for ln in out.splitlines():
+        try:
+            j = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        cur, msg = j.get("__CURSOR"), j.get("MESSAGE", "")
+        if cur:
+            pairs.append((cur, msg))
+    return pairs
+
+def main():
+    ps, pieces, files = load_meta()
+    pairs = new_journal_messages()
+    found, last_cur = [], None
+    for cur, msg in pairs:
+        m = PAT.search(msg)
+        if m:
+            found.append(int(m.group(1)))
+        last_cur = cur
+    if last_cur:
+        with open(CURSOR, 'w') as f:
+            f.write(last_cur)
+
+    if not pairs:
+        log("no new journal entries")
+        return
+    found = sorted(set(found))
+    if not found:
+        log(f"{len(pairs)} entries scanned, no smart-ban events")
+        return
+
+    log(f"smart-ban events for pieces: {found}")
+    rotten, intact, unknown = [], [], []
+    for idx in found:
+        verdict = piece_rotten(idx, ps, pieces, files)
+        if verdict is True:
+            rotten.append(idx)
+        elif verdict is False:
+            intact.append(idx)
+        else:
+            unknown.append(idx)
+    if intact:
+        log(f"skipped (bytes currently valid — healed or race): {intact}")
+    if unknown:
+        log(f"skipped (unverifiable, will re-trigger if real): {unknown}")
+    if not rotten:
+        log("nothing to mark")
+        return
+
+    log(f"confirmed rotten: {rotten} -> invoking {MARK_TOOL}")
+    r = subprocess.run([sys.executable, MARK_TOOL] + [str(x) for x in rotten])
+    if r.returncode == 0:
+        log(f"marked {rotten}; service restarted, peer pool reopened")
+    else:
+        log(f"ERROR: ct-markpiece rc={r.returncode}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

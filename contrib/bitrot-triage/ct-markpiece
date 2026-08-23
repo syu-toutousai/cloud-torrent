@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Manage anacrolix/torrent completion-DB piece records for cloud-torrent.
+
+Usage:
+  ct-markpiece <piece_index>...        mark pieces complete ('i' -> 'c')
+  ct-markpiece --list                  show ledger + current DB state
+  ct-markpiece --revert all            flip ALL ledgered marks back ('c' -> 'i')
+  ct-markpiece --revert <idx>...       revert specific pieces
+
+Every flip is journaled to ~/.config/cloud-torrent/marked-pieces.jsonl so
+manually-marked ("false-poisoned") pieces can be reverted at the end for a
+final clean-source refill.
+"""
+import struct, subprocess, sys, time, os, shutil, json
+
+DB = "/mnt/torrent/.torrent.bolt.db"
+BAK = "/tmp/opencode"
+UNIT = "cloud-torrent.service"
+LEDGER = os.path.expanduser("~/.config/cloud-torrent/marked-pieces.jsonl")
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr); sys.exit(1)
+
+def meta(data):
+    def one(off):
+        m = data[off:off+80]
+        if struct.unpack('<I', m[16:20])[0] != 0xed0cdaed:
+            return None
+        return dict(ps=struct.unpack('<I', m[24:28])[0],
+                    root=struct.unpack('<Q', m[32:40])[0],
+                    tx=struct.unpack('<Q', m[64:72])[0])
+    cands = [x for x in (one(0), one(4096)) if x]
+    if not cands:
+        die("no valid bolt meta")
+    return max(cands, key=lambda x: x['tx'])
+
+def scan(data, mm):
+    """Return {piece_index: (value_byte, abs_offset_of_value)} for all 4-byte records."""
+    PS = mm['ps']; NP = len(data)//PS
+    seen = set(); recs = {}
+    def page(n):
+        o = n*PS; _, fl, cnt, _ = struct.unpack('<QHHI', data[o:o+16])
+        return fl, cnt, o
+    def walk(p):
+        if p in seen or not (0 < p < NP):
+            return
+        seen.add(p)
+        fl, cnt, po = page(p)
+        if fl == 1:
+            for i in range(cnt):
+                b = i*16
+                pos, ksz, ch = struct.unpack('<IIQ', data[po+16+b:po+16+b+16])
+                walk(ch)
+        elif fl == 2:
+            for i in range(cnt):
+                b = i*16
+                f_, pos, ksz, vsz = struct.unpack('<IIII', data[po+16+b:po+16+b+16])
+                ks = po+16+b+pos
+                if f_ == 1 and vsz == 16:
+                    walk(struct.unpack('<Q', data[ks+ksz:ks+ksz+8])[0])
+                elif ksz == 4 and vsz == 1:
+                    recs[int.from_bytes(data[ks:ks+4], 'big')] = (data[ks+ksz], ks+ksz)
+    walk(mm['root'])
+    return recs
+
+def load_db():
+    return bytearray(open(DB, 'rb').read())
+
+def svc_active():
+    return subprocess.run(["systemctl", "is-active", "--quiet", UNIT]).returncode == 0
+
+def svc(action):
+    subprocess.run(["systemctl", action, UNIT], check=False)
+    time.sleep(2)
+
+def backup():
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    bak = f"{BAK}/.torrent.bolt.db.bak_{ts}"
+    shutil.copy2(DB, bak)
+    print(f"[*] backup -> {bak}")
+    return bak
+
+def journal(entry):
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, 'a') as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def ledger_lines():
+    if not os.path.exists(LEDGER):
+        return []
+    out = []
+    with open(LEDGER) as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln:
+                try:
+                    out.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    pass
+    return out
+
+def flipped_pieces():
+    """Pieces currently in 'marked' state (mark without matching later revert)."""
+    reverted = set()
+    marked = []
+    for e in ledger_lines():
+        if e.get("type") == "mark":
+            marked.append(e["piece"])
+        elif e.get("type") == "revert":
+            for p in e.get("pieces", []):
+                reverted.add(p)
+    seenm = []
+    for p in marked:
+        if p not in reverted and p not in seenm:
+            seenm.append(p)
+    return seenm
+
+def do_flip(indices, new_val, action_name, note=""):
+    was_running = svc_active()
+    if was_running:
+        print("[*] stopping service ..."); svc("stop")
+    bak = backup()
+    data = load_db(); mm = meta(data); recs = scan(data, mm)
+    missing = [i for i in indices if i not in recs]
+    if missing:
+        die(f"records not found: {missing}")
+    wrong = {i: chr(recs[i][0]) for i in indices if recs[i][0] != (0x69 if new_val == 0x63 else 0x63)}
+    if wrong:
+        die(f"unexpected current values (refusing): {wrong}")
+    for i in indices:
+        off = recs[i][1]
+        old = data[off]; data[off] = new_val
+        print(f"[*] piece #{i}: offset {hex(off)}  {hex(old)} -> {hex(new_val)}")
+    with open(DB, 'r+b') as f:
+        f.write(bytes(data))
+    chk = scan(open(DB, 'rb').read(), meta(load_db()))
+    assert all(chr(chk[i][0]) == chr(new_val) for i in indices), "read-back failed"
+    print("[*] read-back OK")
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for i in sorted(indices):
+        journal({"type": action_name, "ts": now, "piece": i,
+                 "backup": bak, **({"note": note} if note else {})})
+    if action_name == "revert":
+        journal({"type": "revert-batch", "ts": now, "pieces": sorted(indices)})
+    else:
+        # keep per-piece detail lines compatible with older entries
+        pass
+    if was_running:
+        print("[*] starting service ..."); svc("start")
+        ok = False
+        for _ in range(15):
+            ok = svc_active()
+            if ok:
+                break
+            time.sleep(1)
+        print(f"[*] service active: {ok}")
+
+def cmd_mark(indices):
+    do_flip(indices, 0x63, "mark",
+            note="false-poisoned piece accepted (speed-first triage)")
+
+def cmd_revert(args):
+    if args == ["all"]:
+        pieces = flipped_pieces()
+        if not pieces:
+            print("[*] ledger has no active marks; nothing to revert")
+            return
+    else:
+        pieces = []
+        for a in args:
+            try:
+                pieces.append(int(a))
+            except ValueError:
+                die(f"bad index: {a}")
+    print(f"[*] reverting pieces: {sorted(pieces)}")
+    do_flip(sorted(set(pieces)), 0x69, "revert",
+            note="reopen for clean-source refill")
+
+def cmd_list():
+    marks = flipped_pieces()
+    data = load_db(); mm = meta(data); recs = scan(data, mm)
+    print(f"{'piece':>7}  {'ledger':<8} {'db':<3}  note")
+    for p in marks:
+        dbv = chr(recs[p][0]) if p in recs else '?'
+        print(f"{p:>7}  {'MARKED':<8} {dbv:<3}  poison bytes on disk; revert to refetch")
+    others = sorted(set(recs) - set(marks))
+    print(f"\nledger: {len(marks)} active / {sum(1 for e in ledger_lines() if e.get('type')=='mark')} total marks, "
+          f"{len(recs)} records in DB ({sum(1 for v,_ in recs.values() if chr(v)=='c')} complete)")
+    healed = [e for e in ledger_lines() if e.get("type") == "info"]
+    for e in healed:
+        print(f"info: {e.get('note','')}")
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        die(__doc__)
+    if argv[0] == "--list":
+        cmd_list()
+    elif argv[0] == "--revert":
+        cmd_revert(argv[1:])
+    else:
+        idx = []
+        for a in argv:
+            try:
+                idx.append(int(a))
+            except ValueError:
+                die(f"bad index: {a}")
+        cmd_mark(idx)
+
+if __name__ == "__main__":
+    main()

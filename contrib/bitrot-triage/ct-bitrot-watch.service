@@ -1,0 +1,9 @@
+[Unit]
+Description=bitrot smart-ban auto-triage for cloud-torrent
+After=cloud-torrent.service
+
+[Service]
+Type=oneshot
+User=naruto
+ExecStart=/home/naruto/.local/bin/ct-bitrot-watch
+TimeoutStartSec=300
