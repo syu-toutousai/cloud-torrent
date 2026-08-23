@@ -2,6 +2,18 @@
 
 **Cloud torrent** is a a self-hosted remote torrent client, written in Go (golang). You start torrents remotely, which are downloaded as sets of files on the local disk of the server, which are then retrievable or streamable via HTTP.
 
+> [!NOTE]
+> **Fork roadmap** — planned enhancements over upstream:
+>
+> * **Per-file / per-seeder / per-piece control** — granular enable/disable of individual files, peers, and pieces within a torrent.
+> * **Selective download** — inherit and implement the long-requested upstream feature of choosing which files to fetch when adding a torrent.
+>
+> Once these land, bitrot handling becomes trivial: files known to contain
+> poisoned pieces could simply be paused/excluded — manually or automatically —
+> instead of the offline completion-DB surgery currently required
+> (see [`contrib/bitrot-triage/`](contrib/bitrot-triage/) and
+> [issue #1](../../issues/1) for today's workaround).
+
 ### Features
 
 * Single binary
@@ -126,7 +138,15 @@ In summary, the core features will be:
   
 * **RSS** Automatically add torrents, with smart episode filter.
 
+* **RSS** Automatically add torrents, with smart episode filter.
+
 Once completed, cloud-torrent will no longer be a simple torrent client and most likely project be renamed.
+
+#### Fork additions (near-term, this fork)
+
+* **Per-file / per-seeder / per-piece control** — toggle individual files, peers and pieces; expose piece-level state from the engine.
+* **Selective download** — inherit upstream's selective download request: pick files at add-time instead of downloading everything.
+* Together these make poisoned-piece containment a first-class operation: stop/exclude the affected files directly (manually or via automation) rather than resorting to completion-DB surgery (`contrib/bitrot-triage/`).
 
 #### Donate
 
