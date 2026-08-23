@@ -7,6 +7,7 @@
 >
 > * **Per-file / per-seeder / per-piece control** — granular enable/disable of individual files, peers, and pieces within a torrent.
 > * **Selective download** — inherit and implement the long-requested upstream feature of choosing which files to fetch when adding a torrent.
+> * **Granular smart-ban** — replace IP-level banning with (peer × piece) quarantine + escalation threshold, so bitrotten-but-fast peers keep contributing while poison is discarded locally ([proposal](contrib/bitrot-triage/PROPOSAL-smart-ban-quarantine.md), accepted, implementation deferred until the current torrenting run completes).
 >
 > Once these land, bitrot handling becomes trivial: files known to contain
 > poisoned pieces could simply be paused/excluded — manually or automatically —
@@ -146,6 +147,7 @@ Once completed, cloud-torrent will no longer be a simple torrent client and most
 
 * **Per-file / per-seeder / per-piece control** — toggle individual files, peers and pieces; expose piece-level state from the engine.
 * **Selective download** — inherit upstream's selective download request: pick files at add-time instead of downloading everything.
+* **Granular smart-ban** — (peer × piece) quarantine with escalation to IP-ban; keeps fast bitrot-affected peers connected, drops their poisoned blocks locally. Strictly outperforms both upstream's blunt IP ban and the webtorrent family's total absence of badness handling ([proposal](contrib/bitrot-triage/PROPOSAL-smart-ban-quarantine.md)).
 * Together these make poisoned-piece containment a first-class operation: stop/exclude the affected files directly (manually or via automation) rather than resorting to completion-DB surgery (`contrib/bitrot-triage/`).
 
 #### Donate
