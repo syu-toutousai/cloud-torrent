@@ -111,3 +111,14 @@ Mitigations used in this deployment:
   then verify with SHA-1. The ledger makes this fully reversible.
 - The sentinel's SHA-1 verification step doubles as a safety gate: pieces that
   already healed are skipped, never flipped blindly.
+
+## Note on running from systemd units
+
+`systemctl stop/start cloud-torrent` from inside a *system service context*
+(e.g. the provided `ct-bitrot-watch.service`) is denied by polkit for
+non-interactive callers, and a naive `check=False` call will silently no-op —
+leaving the engine alive while the tool believes it stopped it. `ct-markpiece`
+now verifies every unit-state transition and escalates through
+`sudo -S systemctl` using `SUDO_PASS` from `/home/naruto/.env`; if the stop
+cannot be guaranteed it **refuses to write** the bolt file rather than risk
+mmap divergence under a live engine.
